@@ -175,7 +175,7 @@ STEELS = {
         "n": 5.5,
         "alpha": 0.013,
         "Q": 340e3,
-        "T_recryst": 880,
+        "T_recryst": 850,
         "density": 7840,
         "specific_heat": 610
     }
@@ -242,6 +242,20 @@ with st.sidebar.container():
         b_v = st.slider("Speed sensitivity b (Δμ per ln v)", 0.0, 0.05, 0.01, step=0.005,
                        help="Friction decreases with rolling speed")
     st.markdown('</div>', unsafe_allow_html=True)
+
+st.sidebar.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
+st.sidebar.markdown("#### 🌍 CO₂ / Electricity Settings")
+
+co2_factor = st.sidebar.number_input(
+    "Grid CO₂ factor [kg CO₂/kWh]",
+    min_value=0.0,
+    max_value=2.0,
+    value=0.6,
+    step=0.05,
+    help="Electricity emission intensity. Typical: 0.3–1.0 kg CO₂/kWh depending on grid mix."
+)
+
+st.sidebar.markdown('</div>', unsafe_allow_html=True)
 
 roll = ROLLS[material_choice]
 steel = STEELS[steel_choice]
@@ -1343,6 +1357,7 @@ st.markdown(f"""
   © 2025 {APP_NAME} · Enhanced for Steel InTech Challenge · Built on Von Karman Theory & Temperature-Dependent Material Models
 </div>
 """, unsafe_allow_html=True)
+
 
 
 
