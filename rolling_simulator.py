@@ -280,7 +280,7 @@ def flow_stress_ZH(T_C, edot, A, n, alpha, Q):
     Z_norm = max(1e-20, Z / A)
 
     # alpha is in MPa^-1, so (1/alpha) gives MPa scale
-    sigma = (1.0 / alpha) * math.asinh(Z_norm ** (1.0 / n)) / 1e6
+    sigma = (1.0 / alpha) * math.asinh(Z_norm ** (1.0 / n))
 
     return float(np.clip(sigma, 5.0, 800.0))
 
@@ -1343,6 +1343,7 @@ st.markdown(f"""
   © 2025 {APP_NAME} · Enhanced for Steel InTech Challenge · Built on Von Karman Theory & Temperature-Dependent Material Models
 </div>
 """, unsafe_allow_html=True)
+
 
 
 
