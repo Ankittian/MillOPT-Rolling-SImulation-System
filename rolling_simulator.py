@@ -254,8 +254,9 @@ reduction_ratio = ((h1 - h2) / h1) * 100
 # ==============================
 
 def thermal_conductivity_roll(k_base, k_coeff, T_C):
-    """Temperature-dependent thermal conductivity of roll material"""
-    return k_base * (1 + k_coeff * (T_C - 20))
+    k = k_base * (1 + k_coeff * (T_C - 20))
+    return max(5.0, k)
+
 
 def surface_speed(D_mm, N_rpm):
     """Calculate roll surface speed in m/s"""
@@ -273,31 +274,35 @@ def strain_rate_estimate(h1_mm, h2_mm, D_mm, N_rpm):
     return max(1e-6, v * epsilon / (L * math.sqrt(3)))
 
 def flow_stress_ZH(T_C, edot, A, n, alpha, Q):
-    """Zener-Hollomon based flow stress model - temperature and strain rate dependent"""
+    """Zener-Hollomon based flow stress model (MPa)."""
     T_K = T_C + 273.15
     Z = edot * math.exp(Q / (R_GAS * T_K))
-    # Prevent numerical issues
-    Z_norm = max(1e-12, Z / A)
-    sigma = (1.0 / alpha) * math.asinh(Z_norm ** (1.0 / n)) / 1e6  # Convert to MPa
-    return max(1.0, sigma)
+    Z_norm = max(1e-20, Z / A)
 
-def mu_of_T_v(mu0, a, b_sens, T_C, v, k_roll, model="Temperature-Dependent"):
-    """Enhanced friction coefficient model accounting for temperature, speed, and roll material"""
+    # alpha is in MPa^-1, so (1/alpha) gives MPa scale
+    sigma = (1.0 / alpha) * math.asinh(Z_norm ** (1.0 / n))
+
+    return float(np.clip(sigma, 5.0, 800.0))
+
+
+def mu_of_T_v(mu0, a, b_sens, T_interface, v, k_roll, model="Temperature-Dependent"):
+    """Friction depends on interface temperature and speed."""
     if model == "Constant":
         return float(np.clip(mu0, 0.03, 0.40))
-    
-    # Temperature effect - friction increases with temperature
-    mu = mu0 + a * (T_C - 900.0)
-    
-    if model == "Temperature-Dependent" or model == "Speed-Dependent":
-        # Speed effect - friction decreases with speed (hydrodynamic lubrication)
+
+    # Temp effect: hotter interface => higher μ (scale, lubrication breakdown)
+    mu = mu0 + a * (T_interface - 900.0)
+
+    if model in ["Temperature-Dependent", "Speed-Dependent"]:
+        # Speed effect: higher speed => lower μ
         mu -= b_sens * math.log(max(v, 0.1))
-    
-    # Roll material effect - better thermal conductivity = better cooling = lower friction
+
+    # Roll conduction: higher k => better cooling => lower μ
     roll_factor = (40.0 / max(10.0, k_roll))
     mu *= roll_factor
-    
+
     return float(np.clip(mu, 0.03, 0.40))
+
 
 def friction_factor_from_mu(mu):
     """Convert Coulomb friction to friction factor m for rolling equations"""
@@ -375,89 +380,120 @@ def estimate_roll_temperature_rise(P_kW, k_roll, A_contact, cooling_rate=0.7):
 # ==============================
 # Core Calculation - ENHANCED with Von Kármán
 # ==============================
-def compute_F_T_P(h1, h2, D, b, N_rpm, T_C, T_roll, steel, roll, mu0, a_T, b_v, friction_model):
+def compute_F_T_P(h1, h2, D, b, N_rpm, T_C, T_roll, steel, roll,
+                  mu0, a_T, b_v, friction_model):
     """
     Enhanced rolling calculation with:
-    - Von Kármán roll pressure distribution
-    - Temperature-dependent material properties
-    - Iterative roll flattening
-    - Enhanced torque calculation
+    - Von Kármán mean pressure model
+    - Temperature-dependent flow stress (strip temperature)
+    - Temperature-dependent friction using INTERFACE temperature
+    - Roll heating feedback into friction and power loss
+    - Elastic roll flattening (Hitchcock)
     """
-    R0 = (D / 2) / 1000  # Convert to meters
-    h1_m, h2_m, b_m = h1 / 1000, h2 / 1000, b / 1000
-    
-    # Process kinematics
+
+    # ---- Basic geometry (m) ----
+    R0 = (D / 2) / 1000.0
+    h1_m = h1 / 1000.0
+    h2_m = h2 / 1000.0
+    b_m  = b / 1000.0
+
+    # ---- Kinematics ----
     v = surface_speed(D, N_rpm)
     edot = strain_rate_estimate(h1, h2, D, N_rpm)
-    
-    # Material properties at temperature
-    sigma_bar = flow_stress_ZH(T_C, edot, steel["A"], steel["n"], steel["alpha"], steel["Q"])
-    
-    # Roll thermal conductivity at operating temperature
-    k_roll_actual = thermal_conductivity_roll(roll["k_roll_base"], roll["k_temp_coeff"], T_roll)
-    
-    # Friction coefficient
-    mu = mu_of_T_v(mu0, a_T, b_v, T_C, v, k_roll_actual, friction_model)
-    m = friction_factor_from_mu(mu)
-    
-    # Iterative calculation for roll flattening (2-3 iterations sufficient)
+
+    # ---- Material flow stress at strip temperature (MPa) ----
+    sigma_bar = flow_stress_ZH(
+        T_C, edot,
+        steel["A"], steel["n"], steel["alpha"], steel["Q"]
+    )
+
+    # ---- Roll thermal conductivity at roll temperature ----
+    k_roll_actual = thermal_conductivity_roll(
+        roll["k_roll_base"], roll["k_temp_coeff"], T_roll
+    )
+
+    # ---- Iterative coupling variables ----
     R_eff = R0
     F = 0.0
-    p_mean = 0.0
     L = 0.0
-    
-    for iteration in range(3):
-        # Calculate force using Von Kármán approach
-        F, L, p_mean = calculate_roll_force_von_karman(sigma_bar, m, R_eff, h1_m, h2_m, b_m)
-        
-        # Update effective radius with roll flattening
+    p_mean = 0.0
+    mu = 0.0
+    m = 0.0
+    Tq = 0.0
+    P = 0.0
+
+    # Start roll operating temperature guess
+    T_roll_operating = float(T_roll)
+
+    # ---- Iteration: roll heating -> interface temp -> friction -> force/torque/power ----
+    for _ in range(4):  # 3-4 iterations is enough
+        # Interface temperature model (simple weighted average)
+        # If roll heats up, interface heats -> friction increases
+        T_interface = 0.6 * T_C + 0.4 * T_roll_operating
+
+        # Friction coefficient from interface temp + speed + roll cooling
+        mu = mu_of_T_v(
+            mu0, a_T, b_v,
+            T_interface,
+            v,
+            k_roll_actual,
+            friction_model
+        )
+        m = friction_factor_from_mu(mu)
+
+        # Rolling force with Von Kármán mean pressure
+        F, L, p_mean = calculate_roll_force_von_karman(
+            sigma_bar, m, R_eff, h1_m, h2_m, b_m
+        )
+
+        # Update effective radius from roll flattening
         R_eff_new = effective_radius(R0, F, b_m, roll["E"], roll["nu"])
-        
-        # Check convergence
-        if abs(R_eff_new - R_eff) / R_eff < 0.001:
-            R_eff = R_eff_new
-            break
         R_eff = R_eff_new
-    
-    # Enhanced torque calculation
-    Tq = calculate_torque_enhanced(F, L, m, h1_m, h2_m)
-    
-    # Power calculation
-    P = calculate_power(Tq, N_rpm)
-    
-    # Estimate roll temperature rise
-    A_contact = L * b_m
-    delta_T_roll = estimate_roll_temperature_rise(P / 1000, k_roll_actual, A_contact)
-    T_roll_operating = T_roll + delta_T_roll
-    
-    # Strip exit temperature (simplified - assumes some cooling during rolling)
-    # Typically 20-50°C drop depending on reduction and speed
-    temp_drop_factor = 0.02 * reduction_ratio + 0.005 * v  # Empirical
-    T_exit = T_C - min(temp_drop_factor * 10, 50)
-    
-    # Energy efficiency metrics
-    # Specific energy = energy per unit volume reduced
-    volume_reduced = (h1_m - h2_m) * b_m * 1.0  # per meter length
-    specific_energy = (P * 1.0) / max(1e-9, volume_reduced)  # J/m³·m = J/m²
-    
+
+        # Torque and power
+        Tq = calculate_torque_enhanced(F, L, m, h1_m, h2_m)
+        P = calculate_power(Tq, N_rpm)
+
+        # Roll heating update (feedback loop)
+        A_contact = max(1e-9, L * b_m)  # m²
+        delta_T_roll = estimate_roll_temperature_rise(
+            P / 1000.0,  # kW
+            k_roll_actual,
+            A_contact,
+            cooling_rate=0.7
+        )
+        T_roll_operating = float(T_roll + delta_T_roll)
+
+    # ---- Strip exit temperature (simplified) ----
+    # NOTE: this is empirical and you can refine it later
+    # reduction_ratio is global in your code; safer compute locally
+    reduction_ratio_local = ((h1 - h2) / max(1e-6, h1)) * 100.0
+    temp_drop_factor = 0.02 * reduction_ratio_local + 0.005 * v
+    T_exit = T_C - min(temp_drop_factor * 10.0, 50.0)
+
+    # ---- Specific energy ----
+    # per meter length basis (volume reduced per 1m)
+    volume_reduced = (h1_m - h2_m) * b_m * 1.0
+    specific_energy = (P * 1.0) / max(1e-12, volume_reduced)  # J/m²
+
     return {
-        "F": F,                    # Rolling force (N)
-        "Tq": Tq,                  # Torque (N·m)
-        "P": P,                    # Power (W)
-        "sigma_bar": sigma_bar,    # Flow stress (MPa)
-        "mu": mu,                  # Friction coefficient
-        "m": m,                    # Friction factor
-        "R_eff": R_eff,           # Effective radius (m)
-        "R0": R0,                  # Original radius (m)
-        "L": L,                    # Contact length (m)
-        "v": v,                    # Surface speed (m/s)
-        "edot": edot,             # Strain rate (1/s)
-        "p_mean": p_mean,         # Mean roll pressure (MPa)
-        "T_roll_op": T_roll_operating,  # Operating roll temperature (°C)
-        "T_exit": T_exit,         # Strip exit temperature (°C)
-        "k_roll": k_roll_actual,  # Roll thermal conductivity (W/m·K)
-        "specific_energy": specific_energy,  # Specific energy (J/m²)
-        "roll_flattening": (R_eff - R0) * 1000  # Roll flattening (mm)
+        "F": F,                     # N
+        "Tq": Tq,                   # N·m
+        "P": P,                     # W
+        "sigma_bar": sigma_bar,     # MPa
+        "mu": mu,                   # -
+        "m": m,                     # -
+        "R_eff": R_eff,             # m
+        "R0": R0,                   # m
+        "L": L,                     # m
+        "v": v,                     # m/s
+        "edot": edot,               # 1/s
+        "p_mean": p_mean,           # MPa
+        "T_roll_op": T_roll_operating,  # °C
+        "T_exit": T_exit,           # °C
+        "k_roll": k_roll_actual,    # W/m·K
+        "specific_energy": specific_energy,  # J/m²
+        "roll_flattening": (R_eff - R0) * 1000.0  # mm
     }
 
 # ==============================
@@ -1637,3 +1673,4 @@ st.markdown(f"""
   © 2025 {APP_NAME} · Enhanced for Steel InTech Challenge · Built on Von Karman Theory & Temperature-Dependent Material Models
 </div>
 """, unsafe_allow_html=True)
+
