@@ -1126,7 +1126,6 @@ else:
     energy_kWh_ton = 0.0
 
 # CO₂ calculation (typical Indian grid factor)
-co2_factor = 0.6  # kg CO₂ per kWh
 co2_kg_per_ton = energy_kWh_ton * co2_factor
 
 # Annual production estimate
@@ -1357,6 +1356,7 @@ st.markdown(f"""
   © 2025 {APP_NAME} · Enhanced for Steel InTech Challenge · Built on Von Karman Theory & Temperature-Dependent Material Models
 </div>
 """, unsafe_allow_html=True)
+
 
 
 
